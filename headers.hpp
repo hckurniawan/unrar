@@ -11,13 +11,14 @@
 #define  SIZEOF_SUBBLOCKHEAD    14
 #define  SIZEOF_COMMHEAD        13
 #define  SIZEOF_PROTECTHEAD     26
-#define  SIZEOF_UOHEAD          18
 #define  SIZEOF_STREAMHEAD      26
 
 #define  VER_PACK               29U
 #define  VER_PACK5              50U // It is stored as 0, but we subtract 50 when saving an archive.
+#define  VER_PACK7              70U // It is stored as 1, but we subtract 70 when saving an archive.
 #define  VER_UNPACK             29U
 #define  VER_UNPACK5            50U // It is stored as 0, but we add 50 when reading an archive.
+#define  VER_UNPACK7            70U // It is stored as 1, but we add 50 when reading an archive.
 #define  VER_UNKNOWN          9999U // Just some large value.
 
 #define  MHD_VOLUME         0x0001U
@@ -72,7 +73,8 @@
 #define  EARC_VOLNUMBER     0x0008U // Store a number of current volume.
 
 enum HEADER_TYPE {
-  // RAR 5.0 header types.
+  // RAR 5.0 header types. HEAD_UNKNOWN must be maximum value in enum,
+  // because we reject anything larger than it.
   HEAD_MARK=0x00, HEAD_MAIN=0x01, HEAD_FILE=0x02, HEAD_SERVICE=0x03,
   HEAD_CRYPT=0x04, HEAD_ENDARC=0x05, HEAD_UNKNOWN=0xff,
 
@@ -83,7 +85,7 @@ enum HEADER_TYPE {
 };
 
 
-// RAR 2.9 and earlier.
+// RAR 2.9 and earlier service haeders, mostly outdated and not supported.
 enum { EA_HEAD=0x100,UO_HEAD=0x101,MAC_HEAD=0x102,BEEA_HEAD=0x103,
        NTACL_HEAD=0x104,STREAM_HEAD=0x105 };
 
@@ -105,9 +107,11 @@ enum HOST_SYSTEM_TYPE {
 
 
 // We also use these values in extra field, so do not modify them.
+// FSREDIR_UNKNOWN must be maximum value in enum, because we reject
+// anything larger than it.
 enum FILE_SYSTEM_REDIRECT {
   FSREDIR_NONE=0, FSREDIR_UNIXSYMLINK, FSREDIR_WINSYMLINK, FSREDIR_JUNCTION,
-  FSREDIR_HARDLINK, FSREDIR_FILECOPY
+  FSREDIR_HARDLINK, FSREDIR_FILECOPY, FSREDIR_UNKNOWN
 };
 
 
@@ -148,6 +152,14 @@ struct BaseBlock
   {
     SkipIfUnknown=false;
   }
+
+  // We use it to assign this block data to inherited blocks.
+  // Such function seems to be cleaner than '(BaseBlock&)' cast or adding
+  // 'using BaseBlock::operator=;' to every inherited header.
+  void SetBaseBlock(BaseBlock &Src)
+  {
+    *this=Src;
+  }
 };
 
 
@@ -185,9 +197,9 @@ struct FileHeader:BlockHeader
     uint FileAttr;
     uint SubFlags;
   };
-  wchar FileName[NM];
+  std::wstring FileName;
 
-  Array<byte> SubData;
+  std::vector<byte> SubData;
 
   RarTime mtime;
   RarTime ctime;
@@ -227,7 +239,7 @@ struct FileHeader:BlockHeader
   bool Dir;
   bool CommentInHeader; // RAR 2.0 file comment.
   bool Version;   // name.ext;ver file name containing the version number.
-  size_t WinSize;
+  uint64 WinSize;
   bool Inherited; // New file inherits a subblock when updating a host file (for subblocks only).
 
   // 'true' if file sizes use 8 bytes instead of 4. Not used in RAR 5.0.
@@ -240,7 +252,7 @@ struct FileHeader:BlockHeader
   HOST_SYSTEM_TYPE HSType;
 
   FILE_SYSTEM_REDIRECT RedirType;
-  wchar RedirName[NM];
+  std::wstring RedirName;
   bool DirTarget;
 
   bool UnixOwnerSet,UnixOwnerNumeric,UnixGroupNumeric;
@@ -257,10 +269,10 @@ struct FileHeader:BlockHeader
 
   bool CmpName(const wchar *Name)
   {
-    return(wcscmp(FileName,Name)==0);
+    return FileName==Name;
   }
 
-  FileHeader& operator = (FileHeader &hd);
+//  FileHeader& operator = (FileHeader &hd);
 };
 
 
@@ -325,16 +337,6 @@ struct ProtectHeader:BlockHeader
 };
 
 
-struct UnixOwnersHeader:SubBlockHeader
-{
-  ushort OwnerNameSize;
-  ushort GroupNameSize;
-/* dummy */
-  char OwnerName[256];
-  char GroupName[256];
-};
-
-
 struct EAHeader:SubBlockHeader
 {
   uint UnpSize;
@@ -351,7 +353,7 @@ struct StreamHeader:SubBlockHeader
   byte Method;
   uint StreamCRC;
   ushort StreamNameSize;
-  char StreamName[260];
+  std::string StreamName;
 };
 
 

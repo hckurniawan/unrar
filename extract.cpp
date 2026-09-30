@@ -4,35 +4,28 @@ CmdExtract::CmdExtract(CommandData *Cmd)
 {
   CmdExtract::Cmd=Cmd;
 
-  *ArcName=0;
-  *DestFileName=0;
-
   ArcAnalyzed=false;
-  Analyze=new AnalyzeData;
-  memset(Analyze,0,sizeof(*Analyze));
+  Analyze={};
 
   TotalFileCount=0;
 
   // Common for all archives involved. Set here instead of DoExtract()
-  // to use in unrar.dll too. Allows to avoid LinksToDirs() calls
-  // and save CPU time in no symlinks including ".." in target were extracted.
-#if defined(_WIN_ALL)
-  // We can't expand symlink path components in another symlink target
-  // in Windows. We can't create symlinks in Android now. Even though we do not
-  // really need LinksToDirs() calls in these systems, we still call it
-  // for extra safety, but only if symlink with ".." in target was extracted.
-  ConvertSymlinkPaths=false;
-#else
+  // to use in unrar.dll too.
   // We enable it by default in Unix to care about the case when several
   // archives are unpacked to same directory with several independent RAR runs.
   // Worst case performance penalty for a lot of small files seems to be ~3%.
+  // 2023.09.15: Windows performance impact seems to be negligible,
+  // less than 0.5% when extracting mix of small files and folders.
+  // So for extra security we enabled it for Windows too, even though
+  // unlike Unix, Windows doesn't expand lnk1 in symlink targets like
+  // "lnk1/../dir", but converts such path to "dir".
   ConvertSymlinkPaths=true;
-#endif
 
   Unp=new Unpack(&DataIO);
 #ifdef RAR_SMP
   Unp->SetThreads(Cmd->Threads);
 #endif
+  Unp->AllowLargePages(Cmd->UseLargePages);
 }
 
 
@@ -40,24 +33,21 @@ CmdExtract::~CmdExtract()
 {
   FreeAnalyzeData();
   delete Unp;
-  delete Analyze;
 }
 
 
 void CmdExtract::FreeAnalyzeData()
 {
-  for (size_t I=0;I<RefList.Size();I++)
+  for (size_t I=0;I<RefList.size();I++)
   {
     // We can have undeleted temporary reference source here if extraction
     // was interrupted early or if user refused to overwrite prompt.
-    if (RefList[I].TmpName!=NULL)
+    if (!RefList[I].TmpName.empty())
       DelFile(RefList[I].TmpName);
-    free(RefList[I].RefName);
-    free(RefList[I].TmpName);
   }
-  RefList.Reset();
+  RefList.clear();
 
-  memset(Analyze,0,sizeof(*Analyze));
+  Analyze={};
 }
 
 
@@ -66,19 +56,19 @@ void CmdExtract::DoExtract()
 #if defined(_WIN_ALL) && !defined(SFX_MODULE) && !defined(SILENT)
   Fat32=NotFat32=false;
 #endif
-  PasswordCancelled=false;
+  SuppressNoFilesMessage=false;
   DataIO.SetCurrentCommand(Cmd->Command[0]);
 
-  if (*Cmd->UseStdin==0)
+  if (Cmd->UseStdin.empty())
   {
     FindData FD;
-    while (Cmd->GetArcName(ArcName,ASIZE(ArcName)))
+    while (Cmd->GetArcName(ArcName))
       if (FindFile::FastFind(ArcName,&FD))
         DataIO.TotalArcSize+=FD.Size;
   }
 
   Cmd->ArcNames.Rewind();
-  while (Cmd->GetArcName(ArcName,ASIZE(ArcName)))
+  for (uint ArcCount=0;Cmd->GetArcName(ArcName);ArcCount++)
   {
     if (Cmd->ManualPassword)
       Cmd->Password.Clean(); // Clean user entered password before processing next archive.
@@ -87,6 +77,12 @@ void CmdExtract::DoExtract()
     UseExactVolName=false; // Must be reset here, not in ExtractArchiveInit().
     while (true)
     {
+      // 2025.05.11: Add the empty line between tested archives here instead
+      // of printing two leading "\n" in "\n\nExtracting from", which caused
+      // the extra empty line after the copyright message.
+      if (ArcCount>0)
+        mprintf(L"\n");
+
       EXTRACT_ARC_CODE Code=ExtractArchive();
       if (Code!=EXTRACT_ARC_REPEAT)
         break;
@@ -101,7 +97,7 @@ void CmdExtract::DoExtract()
   if (TotalFileCount==0 && Cmd->Command[0]!='I' && 
       ErrHandler.GetErrorCode()!=RARX_BADPWD) // Not in case of wrong archive password.
   {
-    if (!PasswordCancelled)
+    if (!SuppressNoFilesMessage)
       uiMsg(UIERROR_NOFILESTOEXTRACT,ArcName);
 
     // Other error codes may explain a reason of "no files extracted" clearer,
@@ -123,6 +119,18 @@ void CmdExtract::DoExtract()
 
 void CmdExtract::ExtractArchiveInit(Archive &Arc)
 {
+  // We do not set the test mode it for 'P' command here, because 'P' needs
+  // to perform the actual file write to stdout and test mode prevents
+  // file write.
+  if (Cmd->Command[0]=='T' || Cmd->Command[0]=='I')
+    Cmd->Test=true;
+
+#ifdef PROPAGATE_MOTW
+  // Invoke here, so it is also supported by unrar.dll.
+  if (!Cmd->Test && Cmd->MotwList.ItemsCount()>0)
+    Arc.Motw.ReadZoneIdStream(Arc.FileName,Cmd->MotwAllFields);
+#endif
+
   DataIO.AdjustTotalArcSize(&Arc);
 
   FileCount=0;
@@ -150,7 +158,7 @@ void CmdExtract::ExtractArchiveInit(Archive &Arc)
 EXTRACT_ARC_CODE CmdExtract::ExtractArchive()
 {
   Archive Arc(Cmd);
-  if (*Cmd->UseStdin!=0)
+  if (!Cmd->UseStdin.empty())
   {
     Arc.SetHandleType(FILE_HANDLESTD);
 #ifdef USE_QOPEN
@@ -159,8 +167,10 @@ EXTRACT_ARC_CODE CmdExtract::ExtractArchive()
   }
   else
   {
-#if defined(_WIN_ALL) && !defined(SFX_MODULE) // WinRAR GUI code also resets the cache.
-    if (*Cmd->Command=='T' || Cmd->Test)
+    // We commented out "&& !defined(WINRAR)", because WinRAR GUI code resets
+    // the cache for usual test command, but not for test after archiving.
+#if defined(_WIN_ALL) && !defined(SFX_MODULE)
+    if (Cmd->Command[0]=='T' || Cmd->Test)
       ResetFileCache(ArcName); // Reset the file cache when testing an archive.
 #endif
     if (!Arc.WOpen(ArcName))
@@ -172,8 +182,8 @@ EXTRACT_ARC_CODE CmdExtract::ExtractArchive()
 #if !defined(SFX_MODULE) && !defined(RARDLL)
     if (CmpExt(ArcName,L"rev"))
     {
-      wchar FirstVolName[NM];
-      VolNameToFirstName(ArcName,FirstVolName,ASIZE(FirstVolName),true);
+      std::wstring FirstVolName;
+      VolNameToFirstName(ArcName,FirstVolName,true);
 
       // If several volume names from same volume set are specified
       // and current volume is not first in set and first volume is present
@@ -187,23 +197,33 @@ EXTRACT_ARC_CODE CmdExtract::ExtractArchive()
     }
 #endif
 
-    mprintf(St(MNotRAR),ArcName);
-
+    bool RarExt=false;
 #ifndef SFX_MODULE
-    if (CmpExt(ArcName,L"rar"))
+    RarExt=CmpExt(ArcName,L"rar");
 #endif
-      ErrHandler.SetErrorCode(RARX_WARNING);
+
+    if (RarExt)
+      uiMsg(UIERROR_BADARCHIVE,ArcName); // Non-archive .rar file.
+    else
+      mprintf(St(MNotRAR),ArcName.c_str()); // Non-archive not .rar file, likely in "rar x *.*".
+
+    if (RarExt)
+      ErrHandler.SetErrorCode(RARX_BADARC);
     return EXTRACT_ARC_NEXT;
   }
 
   if (Arc.FailedHeaderDecryption) // Bad archive password.
     return EXTRACT_ARC_NEXT;
 
+#if !defined(SFX_MODULE) && !defined(RARDLL)
+   bool FirstVolume=Arc.FirstVolume; // It can be changed while extracting, so preserve iot here for later checks.
+#endif
+
 #ifndef SFX_MODULE
   if (Arc.Volume && !Arc.FirstVolume && !UseExactVolName)
   {
-    wchar FirstVolName[NM];
-    VolNameToFirstName(ArcName,FirstVolName,ASIZE(FirstVolName),Arc.NewNumbering);
+    std::wstring FirstVolName;
+    VolNameToFirstName(ArcName,FirstVolName,Arc.NewNumbering);
 
     // If several volume names from same volume set are specified
     // and current volume is not first in set and first volume is present
@@ -219,7 +239,7 @@ EXTRACT_ARC_CODE CmdExtract::ExtractArchive()
   int64 VolumeSetSize=0; // Total size of volumes after the current volume.
 
 #ifndef SFX_MODULE
-  if (!ArcAnalyzed && *Cmd->UseStdin==0)
+  if (!ArcAnalyzed && Cmd->UseStdin.empty())
   {
     AnalyzeArchive(Arc.FileName,Arc.Volume,Arc.NewNumbering);
     ArcAnalyzed=true; // Avoid repeated analysis on EXTRACT_ARC_REPEAT.
@@ -231,10 +251,10 @@ EXTRACT_ARC_CODE CmdExtract::ExtractArchive()
 #ifndef SFX_MODULE
     // Try to speed up extraction for independent solid volumes by starting
     // extraction from non-first volume if we can.
-    if (*Analyze->StartName!=0)
+    if (!Analyze.StartName.empty())
     {
-      wcsncpyz(ArcName,Analyze->StartName,ASIZE(ArcName));
-      *Analyze->StartName=0;
+      ArcName=Analyze.StartName;
+      Analyze.StartName.clear();
 
       UseExactVolName=true;
       return EXTRACT_ARC_REPEAT;
@@ -244,15 +264,14 @@ EXTRACT_ARC_CODE CmdExtract::ExtractArchive()
     // Calculate the total size of all accessible volumes.
     // This size is necessary to display the correct total progress indicator.
 
-    wchar NextName[NM];
-    wcsncpyz(NextName,Arc.FileName,ASIZE(NextName));
+    std::wstring NextName=Arc.FileName;
 
     while (true)
     {
       // First volume is already added to DataIO.TotalArcSize 
       // in initial TotalArcSize calculation in DoExtract.
       // So we skip it and start from second volume.
-      NextVolumeName(NextName,ASIZE(NextName),!Arc.NewNumbering);
+      NextVolumeName(NextName,!Arc.NewNumbering);
       FindData FD;
       if (FindFile::FastFind(NextName,&FD))
         VolumeSetSize+=FD.Size;
@@ -264,11 +283,8 @@ EXTRACT_ARC_CODE CmdExtract::ExtractArchive()
 
   ExtractArchiveInit(Arc);
 
-  if (*Cmd->Command=='T' || *Cmd->Command=='I')
-    Cmd->Test=true;
 
-
-  if (*Cmd->Command=='I')
+  if (Cmd->Command[0]=='I')
   {
     Cmd->DisablePercentage=true;
   }
@@ -276,10 +292,10 @@ EXTRACT_ARC_CODE CmdExtract::ExtractArchive()
     uiStartArchiveExtract(!Cmd->Test,ArcName);
 
 #ifndef SFX_MODULE
-  if (Analyze->StartPos!=0)
+  if (Analyze.StartPos!=0)
   {
-    Arc.Seek(Analyze->StartPos,SEEK_SET);
-    Analyze->StartPos=0;
+    Arc.Seek(Analyze.StartPos,SEEK_SET);
+    Analyze.StartPos=0;
   }
 #endif
 
@@ -309,10 +325,70 @@ EXTRACT_ARC_CODE CmdExtract::ExtractArchive()
 #if !defined(SFX_MODULE) && !defined(RARDLL)
   if (Cmd->Test && Arc.Volume)
     RecVolumesTest(Cmd,&Arc,ArcName);
+
+  // Delete archive if exit code is 0 and it is either a single archive
+  // or extraction started from first volume.
+  if (Cmd->DeleteArchive && !Cmd->Test && Cmd->Command[0]!='P' &&
+      ErrHandler.GetErrorCode()==RARX_SUCCESS && (!Arc.Volume || FirstVolume))
+    DeleteArchive(Arc,ArcName);
 #endif
 
   return EXTRACT_ARC_NEXT;
 }
+
+
+#if !defined(SFX_MODULE) && !defined(RARDLL)
+void CmdExtract::DeleteArchive(Archive &Arc,const std::wstring &ArcName)
+{
+  Arc.Close();
+
+  bool DelSuccess=false;
+
+  std::wstring NextName=ArcName; // Use ArcName, because Arc.FileName can refer to non-first volume.
+  while (true) // First archive must exist, so we do not call FileExist(NextName) here.
+  {
+#ifdef _WIN_ALL
+    if (Cmd->DeleteToRecycleBin)
+      DelSuccess=RecycleFile(NextName);
+    else
+      DelSuccess=DelFile(NextName);
+#else
+    DelSuccess=DelFile(NextName);
+#endif
+    uiMsg(UIEVENT_DELADDEDFILE,NextName,(int)DelSuccess,0);
+    if (!DelSuccess || !Arc.Volume)
+      break;
+    NextVolumeName(NextName,!Arc.NewNumbering);
+    if (!FileExist(NextName))
+      break;
+  }
+  if (DelSuccess && Arc.Volume)
+  {
+    // Delete recovery volumes. RAR5 uses the width of name numeric field
+    // in REV same as in RAR, so it is enough to set .rev extension to get
+    // teh first REV name.
+    NextName=ArcName;
+    SetExt(NextName,L"rev");
+    while (FileExist(NextName)) // It is ok for REV to be missing, check here.
+    {
+#ifdef _WIN_ALL
+      if (Cmd->DeleteToRecycleBin)
+        DelSuccess=RecycleFile(NextName);
+      else
+        DelSuccess=DelFile(NextName);
+#else
+      DelSuccess=DelFile(NextName);
+#endif
+      uiMsg(UIEVENT_DELADDEDFILE,NextName,(int)DelSuccess,0);
+      if (!DelSuccess)
+        break;
+      NextVolumeName(NextName,!Arc.NewNumbering);
+    }
+  }
+  if (!DelSuccess)
+    ErrHandler.SetErrorCode(RARX_DELETE);
+}
+#endif
 
 
 bool CmdExtract::ExtractCurrentFile(Archive &Arc,size_t HeaderSize,bool &Repeat)
@@ -340,8 +416,8 @@ bool CmdExtract::ExtractCurrentFile(Archive &Arc,size_t HeaderSize,bool &Repeat)
   if (HeaderType==HEAD_FILE)
   {
     // Unlike Arc.FileName, ArcName might store an old volume name here.
-    if (Analyze->EndPos!=0 && Analyze->EndPos==Arc.CurBlockPos &&
-        (*Analyze->EndName==0 || wcscmp(Analyze->EndName,Arc.FileName)==0))
+    if (Analyze.EndPos!=0 && Analyze.EndPos==Arc.CurBlockPos &&
+        (Analyze.EndName.empty() || Analyze.EndName==Arc.FileName))
       return false;
   }
   else
@@ -380,32 +456,30 @@ bool CmdExtract::ExtractCurrentFile(Archive &Arc,size_t HeaderSize,bool &Repeat)
   // when reading an archive. But we prefer to do it here, because this
   // function is called directly in unrar.dll, so we fix bad parameters
   // passed to dll. Also we want to see real negative sizes in the listing
-  // of corrupt archive. To prevent uninitialized data access perform
+  // of corrupt archive. To prevent the uninitialized data access, perform
   // these checks after rejecting zero length and non-file headers above.
   if (Arc.FileHead.PackSize<0)
     Arc.FileHead.PackSize=0;
   if (Arc.FileHead.UnpSize<0)
     Arc.FileHead.UnpSize=0;
 
-  // 2022.03.20: We might remove this check in the future.
-  // It duplicates Analyze->EndPos and Analyze->EndName in all cases except
-  // volumes on removable media.
+  // This check duplicates Analyze.EndPos and Analyze.EndName
+  // in all cases except volumes on removable media.
   if (!Cmd->Recurse && MatchedArgs>=Cmd->FileArgs.ItemsCount() && AllMatchesExact)
     return false;
 
   int MatchType=MATCH_WILDSUBPATH;
 
   bool EqualNames=false;
-  wchar MatchedArg[NM];
-  int MatchNumber=Cmd->IsProcessFile(Arc.FileHead,&EqualNames,MatchType,0,MatchedArg,ASIZE(MatchedArg));
-  bool MatchFound=MatchNumber!=0;
+  std::wstring MatchedArg;
+  bool MatchFound=Cmd->IsProcessFile(Arc.FileHead,&EqualNames,MatchType,0,&MatchedArg)!=0;
 #ifndef SFX_MODULE
   if (Cmd->ExclPath==EXCL_BASEPATH)
   {
-    wcsncpyz(Cmd->ArcPath,MatchedArg,ASIZE(Cmd->ArcPath));
-    *PointToName(Cmd->ArcPath)=0;
+    Cmd->ArcPath=MatchedArg;
+    GetPathWithSep(Cmd->ArcPath,Cmd->ArcPath);
     if (IsWildcard(Cmd->ArcPath)) // Cannot correctly process path*\* masks here.
-      *Cmd->ArcPath=0;
+      Cmd->ArcPath.clear();
   }
 #endif
   if (MatchFound && !EqualNames)
@@ -416,13 +490,13 @@ bool CmdExtract::ExtractCurrentFile(Archive &Arc,size_t HeaderSize,bool &Repeat)
 #if !defined(SFX_MODULE) && !defined(RARDLL)
   if (Arc.FileHead.SplitBefore && FirstFile && !UseExactVolName)
   {
-    wchar CurVolName[NM];
-    wcsncpyz(CurVolName,ArcName,ASIZE(CurVolName));
-    GetFirstVolIfFullSet(ArcName,Arc.NewNumbering,ArcName,ASIZE(ArcName));
+    std::wstring StartVolName;
+    GetFirstVolIfFullSet(ArcName,Arc.NewNumbering,StartVolName);
 
-    if (wcsicomp(ArcName,CurVolName)!=0 && FileExist(ArcName))
+    if (StartVolName!=ArcName && FileExist(StartVolName))
     {
-      wcsncpyz(Cmd->ArcName,ArcName,ASIZE(ArcName)); // For GUI "Delete archive after extraction".
+      ArcName=StartVolName;
+      Cmd->ArcName=ArcName; // For GUI "Delete archive after extraction".
       // If first volume name does not match the current name and if such
       // volume name really exists, let's unpack from this first volume.
       Repeat=true;
@@ -439,12 +513,11 @@ bool CmdExtract::ExtractCurrentFile(Archive &Arc,size_t HeaderSize,bool &Repeat)
       }
     }
 #endif
-    wcsncpyz(ArcName,CurVolName,ASIZE(ArcName));
   }
 #endif
 
-  wchar ArcFileName[NM];
-  ConvertPath(Arc.FileHead.FileName,ArcFileName,ASIZE(ArcFileName));
+  std::wstring ArcFileName;
+  ConvertPath(&Arc.FileHead.FileName,&ArcFileName);
 
   if (Arc.FileHead.Version)
   {
@@ -490,10 +563,10 @@ bool CmdExtract::ExtractCurrentFile(Archive &Arc,size_t HeaderSize,bool &Repeat)
 
   bool RefTarget=false;
   if (!MatchFound)
-    for (size_t I=0;I<RefList.Size();I++)
-      if (wcscmp(ArcFileName,RefList[I].RefName)==0)
+    for (size_t I=0;I<RefList.size();I++)
+      if (ArcFileName == RefList[I].RefName)
       {
-        ExtractRef *MatchedRef=&RefList[I];
+        ExtractRef &MatchedRef=RefList[I];
       
         if (!Cmd->Test) // While harmless, it is useless for 't'.
         {
@@ -504,11 +577,11 @@ bool CmdExtract::ExtractCurrentFile(Archive &Arc,size_t HeaderSize,bool &Repeat)
           // targets and it is possible that first target isn't unpacked
           // for some reason. Also targets might have associated service blocks
           // like ACLs. All this would complicate processing a lot.
-          wcsncpyz(DestFileName,*Cmd->TempPath!=0 ? Cmd->TempPath:Cmd->ExtrPath,ASIZE(DestFileName));
-          AddEndSlash(DestFileName,ASIZE(DestFileName));
-          wcsncatz(DestFileName,L"__tmp_reference_source_",ASIZE(DestFileName));
-          MkTemp(DestFileName,ASIZE(DestFileName));
-          MatchedRef->TmpName=wcsdup(DestFileName);
+          DestFileName=!Cmd->TempPath.empty() ? Cmd->TempPath:Cmd->ExtrPath;
+          AddEndSlash(DestFileName);
+          DestFileName+=L"__tmp_reference_source_";
+          MkTemp(DestFileName,nullptr);
+          MatchedRef.TmpName=DestFileName;
         }
         RefTarget=true; // Need it even for 't' to test the reference source.
         break;
@@ -520,7 +593,7 @@ bool CmdExtract::ExtractCurrentFile(Archive &Arc,size_t HeaderSize,bool &Repeat)
     else
       MatchFound=false; // Skip only the current file for non-solid archive.
   
-  if (MatchFound || RefTarget || (SkipSolid=Arc.Solid)!=0)
+  if (MatchFound || RefTarget || (SkipSolid=Arc.Solid)!=false)
   {
     // First common call of uiStartFileExtract. It is done before overwrite
     // prompts, so if SkipSolid state is changed below, we'll need to make
@@ -529,10 +602,11 @@ bool CmdExtract::ExtractCurrentFile(Archive &Arc,size_t HeaderSize,bool &Repeat)
       return false;
 
     if (!RefTarget)
-      ExtrPrepareName(Arc,ArcFileName,DestFileName,ASIZE(DestFileName));
+      ExtrPrepareName(Arc,ArcFileName,DestFileName);
 
     // DestFileName can be set empty in case of excessive -ap switch.
-    ExtrFile=!SkipSolid && *DestFileName!=0 && !Arc.FileHead.SplitBefore;
+    // Also exclude empty archived names here.
+    ExtrFile=!SkipSolid && !ArcFileName.empty() && !DestFileName.empty() && !Arc.FileHead.SplitBefore;
 
     if ((Cmd->FreshFiles || Cmd->UpdateFiles) && (Command=='E' || Command=='X'))
     {
@@ -566,6 +640,7 @@ bool CmdExtract::ExtractCurrentFile(Archive &Arc,size_t HeaderSize,bool &Repeat)
       return !Arc.Solid; // Can try extracting next file only in non-solid archive.
     }
 
+#ifndef RAR_NOCRYPT  // For rarext.dll, Setup.SFX and unrar_nocrypt.dll.
     if (Arc.FileHead.Encrypted)
     {
       RarCheckPassword CheckPwd;
@@ -584,7 +659,7 @@ bool CmdExtract::ExtractCurrentFile(Archive &Arc,size_t HeaderSize,bool &Repeat)
 #else
         if (!ExtrGetPassword(Arc,ArcFileName,CheckPwd.IsSet() ? &CheckPwd:NULL))
         {
-          PasswordCancelled=true;
+          SuppressNoFilesMessage=true;
           return false;
         }
 #endif
@@ -592,19 +667,19 @@ bool CmdExtract::ExtractCurrentFile(Archive &Arc,size_t HeaderSize,bool &Repeat)
         // Set a password before creating the file, so we can skip creating
         // in case of wrong password.
         SecPassword FilePassword=Cmd->Password;
-  #if defined(_WIN_ALL) && !defined(SFX_MODULE)
+#if defined(_WIN_ALL) && !defined(SFX_MODULE)
         ConvertDosPassword(Arc,FilePassword);
-  #endif
+#endif
 
         byte PswCheck[SIZE_PSWCHECK];
-        DataIO.SetEncryption(false,Arc.FileHead.CryptMethod,&FilePassword,
-               Arc.FileHead.SaltSet ? Arc.FileHead.Salt:NULL,
+        bool EncSet=DataIO.SetEncryption(false,Arc.FileHead.CryptMethod,
+               &FilePassword,Arc.FileHead.SaltSet ? Arc.FileHead.Salt:nullptr,
                Arc.FileHead.InitV,Arc.FileHead.Lg2Count,
                Arc.FileHead.HashKey,PswCheck);
 
         // If header is damaged, we cannot rely on password check value,
         // because it can be damaged too.
-        if (Arc.FileHead.UsePswCheck && !Arc.BrokenHeader &&
+        if (EncSet && Arc.FileHead.UsePswCheck && !Arc.BrokenHeader &&
             memcmp(Arc.FileHead.PswCheck,PswCheck,SIZE_PSWCHECK)!=0)
         {
           if (GlobalPassword) // For -p<pwd> or Ctrl+P to avoid the infinite loop.
@@ -622,16 +697,16 @@ bool CmdExtract::ExtractCurrentFile(Archive &Arc,size_t HeaderSize,bool &Repeat)
 
             // Avoid new requests for unrar.dll to prevent the infinite loop
             // if app always returns the same password.
-  #ifndef RARDLL
+#ifndef RARDLL
             continue; // Request a password again.
-  #endif
+#endif
           }
-  #ifdef RARDLL
+#ifdef RARDLL
           // If we already have ERAR_EOPEN as result of missing volume,
           // we should not replace it with less precise ERAR_BAD_PASSWORD.
           if (Cmd->DllError!=ERAR_EOPEN)
             Cmd->DllError=ERAR_BAD_PASSWORD;
-  #endif
+#endif
           ErrHandler.SetErrorCode(RARX_BADPWD);
           ExtrFile=false;
         }
@@ -640,14 +715,27 @@ bool CmdExtract::ExtractCurrentFile(Archive &Arc,size_t HeaderSize,bool &Repeat)
     }
     else
       DataIO.SetEncryption(false,CRYPT_NONE,NULL,NULL,NULL,0,NULL,NULL);
+#endif // RAR_NOCRYPT
+
+    // Per file symlink conversion flag. Can be turned off in unrar.dll.
+    bool CurConvertSymlinkPaths=ConvertSymlinkPaths;
 
 #ifdef RARDLL
-    if (*Cmd->DllDestName!=0)
-      wcsncpyz(DestFileName,Cmd->DllDestName,ASIZE(DestFileName));
+    if (!Cmd->DllDestName.empty())
+    {
+      DestFileName=Cmd->DllDestName;
+
+      // If unrar.dll sets the entire destination pathname, there is no
+      // destination path and we can't convert symlinks, because we would
+      // risk converting important user or system symlinks in this case.
+      // If DllDestName is set, it turns off our path processing and app
+      // invoking the library cares about everything including safety.
+      CurConvertSymlinkPaths=false;
+    }
 #endif
 
     if (ExtrFile && Command!='P' && !Cmd->Test && !Cmd->AbsoluteLinks &&
-        ConvertSymlinkPaths)
+        CurConvertSymlinkPaths)
       ExtrFile=LinksToDirs(DestFileName,Cmd->ExtrPath,LastCheckedSymlink);
 
     File CurFile;
@@ -655,13 +743,17 @@ bool CmdExtract::ExtractCurrentFile(Archive &Arc,size_t HeaderSize,bool &Repeat)
     bool LinkEntry=Arc.FileHead.RedirType!=FSREDIR_NONE;
     if (LinkEntry && (Arc.FileHead.RedirType!=FSREDIR_FILECOPY))
     {
+      if (Cmd->SkipSymLinks && (Arc.FileHead.RedirType==FSREDIR_UNIXSYMLINK ||
+          Arc.FileHead.RedirType==FSREDIR_WINSYMLINK || Arc.FileHead.RedirType==FSREDIR_JUNCTION))
+        ExtrFile=false;
+
       if (ExtrFile && Command!='P' && !Cmd->Test)
       {
         // Overwrite prompt for symbolic and hard links and when we move
         // a temporary file to the file reference instead of copying it.
         bool UserReject=false;
-        if (FileExist(DestFileName) && !UserReject)
-          FileCreate(Cmd,NULL,DestFileName,ASIZE(DestFileName),&UserReject,Arc.FileHead.UnpSize,&Arc.FileHead.mtime);
+        if (FileExist(DestFileName))
+          FileCreate(Cmd,NULL,DestFileName,&UserReject,Arc.FileHead.UnpSize,&Arc.FileHead.mtime);
         if (UserReject)
           ExtrFile=false;
       }
@@ -680,7 +772,36 @@ bool CmdExtract::ExtractCurrentFile(Archive &Arc,size_t HeaderSize,bool &Repeat)
       }
       else
         if (ExtrFile) // Create files and file copies (FSREDIR_FILECOPY).
-          ExtrFile=ExtrCreateFile(Arc,CurFile);
+        {
+          // Check the dictionary size before creating a file and issuing
+          // any overwrite prompts.
+          if (!CheckWinLimit(Arc,ArcFileName))
+            return false;
+
+          // 2025.09.03: OpenIndiana info is likely outdated, see https://www.illumos.org/issues/2000
+          // Read+write mode is required to set "Compressed" attribute.
+          // Other than that prefer the write only mode to avoid
+          // OpenIndiana NAS problem with SetFileTime and read+write files.
+#if defined(_WIN_ALL) && !defined(SFX_MODULE)
+          bool Compressed=Cmd->SetCompressedAttr &&
+               (Arc.FileHead.FileAttr & FILE_ATTRIBUTE_COMPRESSED)!=0;
+          bool WriteOnly=!Compressed;
+#else
+          bool WriteOnly=true;
+#endif
+
+          ExtrFile=ExtrCreateFile(Arc,CurFile,WriteOnly);
+
+#if defined(_WIN_ALL) && !defined(SFX_MODULE)
+          // 2024.03.12: Set early to compress written data immediately.
+          // For 10 GB text file it was ~1.5x faster than when set after close.
+
+          if (ExtrFile && Compressed)
+            SetFileCompression(CurFile.GetHandle(),true);
+
+#endif
+
+        }
 
     if (!ExtrFile && Arc.Solid)
     {
@@ -693,6 +814,9 @@ bool CmdExtract::ExtractCurrentFile(Archive &Arc,size_t HeaderSize,bool &Repeat)
       // if user answered "No" to overwrite prompt when unpacking
       // a solid archive.
       if (!uiStartFileExtract(ArcFileName,false,false,true))
+        return false;
+      // Check the dictionary size also for skipping files.
+      if (!CheckWinLimit(Arc,ArcFileName))
         return false;
     }
     if (ExtrFile)
@@ -716,21 +840,21 @@ bool CmdExtract::ExtractCurrentFile(Archive &Arc,size_t HeaderSize,bool &Repeat)
       FileCount++;
       if (Command!='I' && !Cmd->DisableNames)
         if (SkipSolid)
-          mprintf(St(MExtrSkipFile),ArcFileName);
+          mprintf(St(MExtrSkipFile),ArcFileName.c_str());
         else
           switch(Cmd->Test ? 'T':Command) // "Test" can be also enabled by -t switch.
           {
             case 'T':
-              mprintf(St(MExtrTestFile),ArcFileName);
+              mprintf(St(MExtrTestFile),ArcFileName.c_str());
               break;
 #ifndef SFX_MODULE
             case 'P':
-              mprintf(St(MExtrPrinting),ArcFileName);
+              mprintf(St(MExtrPrinting),ArcFileName.c_str());
               break;
 #endif
             case 'X':
             case 'E':
-              mprintf(St(MExtrFile),DestFileName);
+              mprintf(St(MExtrFile),DestFileName.c_str());
               break;
           }
       if (!Cmd->DisablePercentage && !Cmd->DisableNames)
@@ -760,7 +884,7 @@ bool CmdExtract::ExtractCurrentFile(Archive &Arc,size_t HeaderSize,bool &Repeat)
 
       uint64 Preallocated=0;
       if (!TestMode && !Arc.BrokenHeader && Arc.FileHead.UnpSize>1000000 &&
-          Arc.FileHead.PackSize*1024>Arc.FileHead.UnpSize && Arc.IsSeekable() &&
+          Arc.FileHead.PackSize>Arc.FileHead.UnpSize/1024 && Arc.IsSeekable() &&
           (Arc.FileHead.UnpSize<100000000 || Arc.FileLength()>Arc.FileHead.PackSize))
       {
         CurFile.Prealloc(Arc.FileHead.UnpSize);
@@ -778,7 +902,7 @@ bool CmdExtract::ExtractCurrentFile(Archive &Arc,size_t HeaderSize,bool &Repeat)
 
         if (Type==FSREDIR_HARDLINK || Type==FSREDIR_FILECOPY)
         {
-          wchar RedirName[NM];
+          std::wstring RedirName;
         
           // 2022.11.15: Might be needed when unpacking WinRAR 5.0 links with
           // Unix RAR. WinRAR 5.0 used \ path separators here, when beginning
@@ -787,17 +911,18 @@ bool CmdExtract::ExtractCurrentFile(Archive &Arc,size_t HeaderSize,bool &Repeat)
           // We must perform this conversion before ConvertPath call,
           // so paths mixing different slashes like \dir1/dir2\file are
           // processed correctly.
-          SlashToNative(Arc.FileHead.RedirName,RedirName,ASIZE(RedirName));
+          SlashToNative(Arc.FileHead.RedirName,RedirName);
 
-          ConvertPath(RedirName,RedirName,ASIZE(RedirName));
+          // Ensure that target is inside of destination folder.
+          ConvertPath(&RedirName,&RedirName);
 
-          wchar NameExisting[NM];
-          ExtrPrepareName(Arc,RedirName,NameExisting,ASIZE(NameExisting));
-          if (FileCreateMode && *NameExisting!=0) // *NameExisting can be 0 in case of excessive -ap switch.
+          std::wstring NameExisting;
+          ExtrPrepareName(Arc,RedirName,NameExisting);
+          if (FileCreateMode && !NameExisting.empty()) // *NameExisting can be empty in case of excessive -ap switch.
             if (Type==FSREDIR_HARDLINK)
-              LinkSuccess=ExtractHardlink(Cmd,DestFileName,NameExisting,ASIZE(NameExisting));
+              LinkSuccess=ExtractHardlink(Cmd,DestFileName,NameExisting);
             else
-              LinkSuccess=ExtractFileCopy(CurFile,Arc.FileName,RedirName,DestFileName,NameExisting,ASIZE(NameExisting),Arc.FileHead.UnpSize);
+              LinkSuccess=ExtractFileCopy(CurFile,Arc.FileName,RedirName,DestFileName,NameExisting,Arc.FileHead.UnpSize);
         }
         else
           if (Type==FSREDIR_UNIXSYMLINK || Type==FSREDIR_WINSYMLINK || Type==FSREDIR_JUNCTION)
@@ -806,6 +931,7 @@ bool CmdExtract::ExtractCurrentFile(Archive &Arc,size_t HeaderSize,bool &Repeat)
             {
               bool UpLink;
               LinkSuccess=ExtractSymlink(Cmd,DataIO,Arc,DestFileName,UpLink);
+
               ConvertSymlinkPaths|=LinkSuccess && UpLink;
 
               // We do not actually need to reset the cache here if we cache
@@ -843,9 +969,20 @@ bool CmdExtract::ExtractCurrentFile(Archive &Arc,size_t HeaderSize,bool &Repeat)
             UnstoreFile(DataIO,Arc.FileHead.UnpSize);
           else
           {
-            Unp->Init(Arc.FileHead.WinSize,Arc.FileHead.Solid);
+            try
+            {
+              Unp->Init(Arc.FileHead.WinSize,Arc.FileHead.Solid);
+            }
+            catch (std::bad_alloc)
+            {
+              if (Arc.FileHead.WinSize>=0x40000000)
+                uiMsg(UIERROR_EXTRDICTOUTMEM,Arc.FileName,uint(Arc.FileHead.WinSize/0x40000000+(Arc.FileHead.WinSize%0x40000000!=0 ? 1 : 0)));
+              throw;
+            }
+
             Unp->SetDestSize(Arc.FileHead.UnpSize);
 #ifndef SFX_MODULE
+            // RAR 1.3 - 1.5 archives do not set per file solid flag.
             if (Arc.Format!=RARFMT50 && Arc.FileHead.UnpVer<=15)
               Unp->DoUnpack(15,FileCount>1 && Arc.Solid);
             else
@@ -910,58 +1047,78 @@ bool CmdExtract::ExtractCurrentFile(Archive &Arc,size_t HeaderSize,bool &Repeat)
         if (SkipSolid) 
           mprintf(L"\b\b\b\b\b     ");
       }
-
-      // If we successfully unpacked a hard link, we wish to set its file
-      // attributes. Hard link shares file metadata with link target,
-      // so we do not need to set link time or owner. But when we overwrite
-      // an existing link, we can call PrepareToDelete(), which affects
-      // link target attributes as well. So we set link attributes to restore
-      // both target and link attributes if PrepareToDelete() changed them.
-      bool SetAttrOnly=LinkEntry && Arc.FileHead.RedirType==FSREDIR_HARDLINK && LinkSuccess;
-
       if (!TestMode && (Command=='X' || Command=='E') &&
-          (!LinkEntry || SetAttrOnly || Arc.FileHead.RedirType==FSREDIR_FILECOPY && LinkSuccess) && 
-          (!BrokenFile || Cmd->KeepBroken))
+          (!LinkEntry || LinkSuccess) && (!BrokenFile || Cmd->KeepBroken))
       {
+        // Set everything for usual files and file references.
+        bool SetAll=!LinkEntry || Arc.FileHead.RedirType==FSREDIR_FILECOPY;
+
+        // Set time and adjust size for usual files and references.
+        // Symlink time requires the special treatment and it is set directly
+        // after creating a symlink.
+        bool SetTimeAndSize=SetAll;
+
+        // Set file attributes for usual files, references and hard links.
+        // Hard link shares the file metadata with link target, so we do not
+        // need to set link time or owner. But when we overwrite an existing
+        // link, we can call PrepareToDelete(), which affects link target
+        // attributes too. So we set link attributes to restore both target
+        // and link attributes if PrepareToDelete() has changed them.
+        bool SetAttr=SetAll || Arc.FileHead.RedirType==FSREDIR_HARDLINK;
+
+        // Call SetFileHeaderExtra to set Unix user and group for usual files,
+        // references and symlinks. Unix symlink can have its own owner data.
+        bool SetExtra=SetAll || Arc.FileHead.RedirType==FSREDIR_UNIXSYMLINK;
+
         // Below we use DestFileName instead of CurFile.FileName,
         // so we can set file attributes also for hard links, which do not
         // have the open CurFile. These strings are the same for other items.
 
-        if (!SetAttrOnly)
+        if (SetTimeAndSize)
         {
-          // We could preallocate more space that really written to broken file
+          // We could preallocate more space than really written to broken file
           // or file with crafted header.
           if (Preallocated>0 && (BrokenFile || DataIO.CurUnpWrite!=Preallocated))
             CurFile.Truncate();
 
+#ifdef PROPAGATE_MOTW
+          Arc.Motw.CreateZoneIdStream(DestFileName,Cmd->MotwList);
+#endif
 
           CurFile.SetOpenFileTime(
             Cmd->xmtime==EXTTIME_NONE ? NULL:&Arc.FileHead.mtime,
             Cmd->xctime==EXTTIME_NONE ? NULL:&Arc.FileHead.ctime,
             Cmd->xatime==EXTTIME_NONE ? NULL:&Arc.FileHead.atime);
           CurFile.Close();
+        }
 
+        if (SetExtra)
           SetFileHeaderExtra(Cmd,Arc,DestFileName);
 
+        if (SetTimeAndSize)
           CurFile.SetCloseFileTime(
             Cmd->xmtime==EXTTIME_NONE ? NULL:&Arc.FileHead.mtime,
             Cmd->xatime==EXTTIME_NONE ? NULL:&Arc.FileHead.atime);
-        }
         
-#if defined(_WIN_ALL) && !defined(SFX_MODULE)
-        if (Cmd->SetCompressedAttr &&
-            (Arc.FileHead.FileAttr & FILE_ATTRIBUTE_COMPRESSED)!=0)
-          SetFileCompression(DestFileName,true);
-        if (Cmd->ClearArc)
-          Arc.FileHead.FileAttr&=~FILE_ATTRIBUTE_ARCHIVE;
-#endif
-        if (!Cmd->IgnoreGeneralAttr && !SetFileAttr(DestFileName,Arc.FileHead.FileAttr))
+        if (SetAttr)
         {
-          uiMsg(UIERROR_FILEATTR,Arc.FileName,DestFileName);
-          // Android cannot set file attributes and while UIERROR_FILEATTR
-          // above is handled by Android RAR silently, this call would cause
-          // "Operation not permitted" message for every unpacked file.
-          ErrHandler.SysErrMsg();
+          auto FileAttr=Arc.FileHead.FileAttr;
+#if defined(_WIN_ALL) && !defined(SFX_MODULE)
+          if (Cmd->ClearArc)
+            FileAttr&=~FILE_ATTRIBUTE_ARCHIVE;
+#endif
+#ifdef _UNIX
+          if (geteuid()!=0) // Unless root.
+            FileAttr &= ~(S_ISUID|S_ISGID); // Strip SUID and SGID for standard users.
+#endif
+          if (!Cmd->IgnoreGeneralAttr && !SetFileAttr(DestFileName,FileAttr))
+          {
+            uiMsg(UIERROR_FILEATTR,Arc.FileName,DestFileName);
+            // Android cannot set file attributes and while UIERROR_FILEATTR
+            // above is handled by Android RAR silently, this call would cause
+            // "Operation not permitted" message for every unpacked file.
+            ErrHandler.SysErrMsg();
+          }
         }
 
         PrevProcessed=true;
@@ -987,42 +1144,44 @@ bool CmdExtract::ExtractCurrentFile(Archive &Arc,size_t HeaderSize,bool &Repeat)
 
 void CmdExtract::UnstoreFile(ComprDataIO &DataIO,int64 DestUnpSize)
 {
-  Array<byte> Buffer(File::CopyBufferSize());
+  std::vector<byte> Buffer(File::CopyBufferSize());
   while (true)
   {
-    int ReadSize=DataIO.UnpRead(&Buffer[0],Buffer.Size());
+    int ReadSize=DataIO.UnpRead(Buffer.data(),Buffer.size());
     if (ReadSize<=0)
       break;
     int WriteSize=ReadSize<DestUnpSize ? ReadSize:(int)DestUnpSize;
     if (WriteSize>0)
     {
-      DataIO.UnpWrite(&Buffer[0],WriteSize);
+      DataIO.UnpWrite(Buffer.data(),WriteSize);
       DestUnpSize-=WriteSize;
     }
   }
 }
 
 
-bool CmdExtract::ExtractFileCopy(File &New,wchar *ArcName,const wchar *RedirName,wchar *NameNew,wchar *NameExisting,size_t NameExistingSize,int64 UnpSize)
+bool CmdExtract::ExtractFileCopy(File &New,const std::wstring &ArcName,const std::wstring &RedirName,const std::wstring &NameNew,const std::wstring &NameExisting,int64 UnpSize)
 {
   File Existing;
   if (!Existing.Open(NameExisting))
   {
+    std::wstring TmpExisting=NameExisting; // NameExisting is 'const', so copy it here.
+
     bool OpenFailed=true;
     // If we couldn't find the existing file, check if match is present
     // in temporary reference sources list.
-    for (size_t I=0;I<RefList.Size();I++)
-      if (wcscmp(RedirName,RefList[I].RefName)==0 && RefList[I].TmpName!=NULL)
+    for (size_t I=0;I<RefList.size();I++)
+      if (RedirName==RefList[I].RefName && !RefList[I].TmpName.empty())
       {
         // If only one reference left targeting to this temporary file,
         // it is faster to move the file instead of copying and deleting it.
         bool RefMove=RefList[I].RefCount-- == 1;
-        NameExisting=RefList[I].TmpName;
+        TmpExisting=RefList[I].TmpName;
         if (RefMove) // Only one reference left for this temporary file.
         {
           New.Delete(); // Delete the previously opened destination file.
           // Try moving the file first.
-          bool MoveFailed=!RenameFile(NameExisting,NameNew);
+          bool MoveFailed=!RenameFile(TmpExisting,NameNew);
           if (MoveFailed)
           {
             // If move failed, re-create the destination and try coping.
@@ -1038,20 +1197,19 @@ bool CmdExtract::ExtractFileCopy(File &New,wchar *ArcName,const wchar *RedirName
               New.Seek(0,SEEK_END);
             // We already moved the file, so clean the name to not try
             // deleting non-existent temporary file later.
-            free(RefList[I].TmpName);
-            RefList[I].TmpName=NULL;
+            RefList[I].TmpName.clear();
             return true;
           }
         }
         if (!RefMove)
-          OpenFailed=!Existing.Open(NameExisting);
+          OpenFailed=!Existing.Open(TmpExisting);
         break;
       }
 
     if (OpenFailed)
     {
-      ErrHandler.OpenErrorMsg(NameExisting);
-      uiMsg(UIERROR_FILECOPY,ArcName,NameExisting,NameNew);
+      ErrHandler.OpenErrorMsg(TmpExisting);
+      uiMsg(UIERROR_FILECOPY,ArcName,TmpExisting,NameNew);
       uiMsg(UIERROR_FILECOPYHINT,ArcName);
 #ifdef RARDLL
       Cmd->DllError=ERAR_EREFERENCE;
@@ -1060,20 +1218,20 @@ bool CmdExtract::ExtractFileCopy(File &New,wchar *ArcName,const wchar *RedirName
     }
   }
 
-  Array<byte> Buffer(0x100000);
+  std::vector<byte> Buffer(0x100000);
   int64 CopySize=0;
 
   while (true)
   {
     Wait();
-    int ReadSize=Existing.Read(&Buffer[0],Buffer.Size());
+    int ReadSize=Existing.Read(Buffer.data(),Buffer.size());
     if (ReadSize==0)
       break;
     // Update only the current file progress in WinRAR, set the total to 0
     // to keep it as is. It looks better for WinRAR.
     uiExtractProgress(CopySize,UnpSize,0,0);
 
-    New.Write(&Buffer[0],ReadSize);
+    New.Write(Buffer.data(),ReadSize);
     CopySize+=ReadSize;
   }
 
@@ -1081,23 +1239,32 @@ bool CmdExtract::ExtractFileCopy(File &New,wchar *ArcName,const wchar *RedirName
 }
 
 
-void CmdExtract::ExtrPrepareName(Archive &Arc,const wchar *ArcFileName,wchar *DestName,size_t DestSize)
+void CmdExtract::ExtrPrepareName(Archive &Arc,const std::wstring &ArcFileName,std::wstring &DestName)
 {
+  if (ArcFileName.empty())
+  {
+    // Return the empty destination for empty source. Extraction code skips
+    // empty archived names without creating the destination path and issuing
+    // "can't create the file" error message.
+    DestName.clear();
+    return;
+  }
+
   if (Cmd->Test)
   {
     // Destination name conversion isn't needed for simple archive test.
     // This check also allows to avoid issuing "Attempting to correct...
     // Renaming..." messages in MakeNameCompatible() below for problematic
     // names like aux.txt when testing an archive.
-    wcsncpyz(DestName,ArcFileName,DestSize);
+    DestName=ArcFileName;
     return;
   }
   
-  wcsncpyz(DestName,Cmd->ExtrPath,DestSize);
+  DestName=Cmd->ExtrPath;
 
-  if (*Cmd->ExtrPath!=0)
+  if (!Cmd->ExtrPath.empty())
   {
-     wchar LastChar=*PointToLastChar(Cmd->ExtrPath);
+    wchar LastChar=GetLastChar(Cmd->ExtrPath);
     // We need IsPathDiv check here to correctly handle Unix forward slash
     // in the end of destination path in Windows: rar x arc dest/
     // so we call IsPathDiv first instead of just calling AddEndSlash,
@@ -1106,7 +1273,7 @@ void CmdExtract::ExtrPrepareName(Archive &Arc,const wchar *ArcFileName,wchar *De
     if (!IsPathDiv(LastChar) && !IsDriveDiv(LastChar))
     {
       // Destination path can be without trailing slash if it come from GUI shell.
-      AddEndSlash(DestName,DestSize);
+      AddEndSlash(DestName);
     }
   }
 
@@ -1116,38 +1283,40 @@ void CmdExtract::ExtrPrepareName(Archive &Arc,const wchar *ArcFileName,wchar *De
     switch(Cmd->AppendArcNameToPath)
     {
       case APPENDARCNAME_DESTPATH: // To subdir of destination path.
-        wcsncatz(DestName,PointToName(Arc.FirstVolumeName),DestSize);
-        SetExt(DestName,NULL,DestSize);
+        DestName+=PointToName(Arc.FirstVolumeName);
+        RemoveExt(DestName);
         break;
       case APPENDARCNAME_OWNSUBDIR: // To subdir of archive own dir.
-        wcsncpyz(DestName,Arc.FirstVolumeName,DestSize);
-        SetExt(DestName,NULL,DestSize);
+        DestName=Arc.FirstVolumeName;
+        RemoveExt(DestName);
         break;
       case APPENDARCNAME_OWNDIR:  // To archive own dir.
-        wcsncpyz(DestName,Arc.FirstVolumeName,DestSize);
+        DestName=Arc.FirstVolumeName;
         RemoveNameFromPath(DestName);
         break;
     }
-    AddEndSlash(DestName,DestSize);
+    AddEndSlash(DestName);
   }
 #endif
-
+  // We need to modify the name below and ArcFileName is const.
+  std::wstring CurName=ArcFileName;
 #ifndef SFX_MODULE
-  wchar *ArcPath=*Cmd->ExclArcPath!=0 ? Cmd->ExclArcPath:Cmd->ArcPath;
-  size_t ArcPathLength=wcslen(ArcPath);
+  std::wstring &ArcPath=!Cmd->ExclArcPath.empty() ? Cmd->ExclArcPath:Cmd->ArcPath;
+  size_t ArcPathLength=ArcPath.size();
   if (ArcPathLength>0)
   {
-    size_t NameLength=wcslen(ArcFileName);
-    if (NameLength>=ArcPathLength &&  wcsnicompc(ArcPath,ArcFileName,ArcPathLength)==0 &&
+    size_t NameLength=CurName.size();
+    if (NameLength>=ArcPathLength && wcsnicompc(ArcPath,CurName,ArcPathLength)==0 &&
         (IsPathDiv(ArcPath[ArcPathLength-1]) || 
-         IsPathDiv(ArcFileName[ArcPathLength]) || ArcFileName[ArcPathLength]==0))
+         IsPathDiv(CurName[ArcPathLength]) || CurName[ArcPathLength]==0))
     {
-      ArcFileName+=Min(ArcPathLength,NameLength);
-      while (IsPathDiv(*ArcFileName))
-        ArcFileName++;
-      if (*ArcFileName==0) // Excessive -ap switch.
+      size_t Pos=Min(ArcPathLength,NameLength);
+      while (Pos<CurName.size() && IsPathDiv(CurName[Pos]))
+        Pos++;
+      CurName.erase(0,Pos);
+      if (CurName.empty()) // Excessive -ap switch.
       {
-        *DestName=0;
+        DestName.clear();
         return;
       }
     }
@@ -1158,38 +1327,31 @@ void CmdExtract::ExtrPrepareName(Archive &Arc,const wchar *ArcFileName,wchar *De
   // Use -ep3 only in systems, where disk letters are exist, not in Unix.
   bool AbsPaths=Cmd->ExclPath==EXCL_ABSPATH && Command=='X' && IsDriveDiv(':');
 
-  // We do not use any user specified destination paths when extracting
-  // absolute paths in -ep3 mode.
   if (AbsPaths)
-    *DestName=0;
+  {
+    // We do not use a user specified destination path when extracting
+    // absolute paths in -ep3 mode.
+    wchar DiskLetter=toupperw(CurName[0]);
+    if (DiskLetter>='A' && DiskLetter<='Z' && CurName[1]=='_' && IsPathDiv(CurName[2]))
+      DestName=CurName.substr(0,1) + L':' + CurName.substr(2);
+    else
+      if (CurName[0]=='_' && CurName[1]=='_')
+        DestName=std::wstring(2,CPATHDIVIDER) + CurName.substr(2);
+      else
+        AbsPaths=false; // Apply the destination path even with -ep3 for not absolute path.
+  }
 
   if (Command=='E' || Cmd->ExclPath==EXCL_SKIPWHOLEPATH)
-    wcsncatz(DestName,PointToName(ArcFileName),DestSize);
-  else
-    wcsncatz(DestName,ArcFileName,DestSize);
+    CurName=PointToName(CurName);
+  if (!AbsPaths)
+    DestName+=CurName;
 
 #ifdef _WIN_ALL
   // Must do after Cmd->ArcPath processing above, so file name and arc path
   // trailing spaces are in sync.
   if (!Cmd->AllowIncompatNames)
-    MakeNameCompatible(DestName,DestSize);
+    MakeNameCompatible(DestName);
 #endif
-
-  wchar DiskLetter=toupperw(DestName[0]);
-
-  if (AbsPaths)
-  {
-    if (DestName[1]=='_' && IsPathDiv(DestName[2]) &&
-        DiskLetter>='A' && DiskLetter<='Z')
-      DestName[1]=':';
-    else
-      if (DestName[0]=='_' && DestName[1]=='_')
-      {
-        // Convert __server\share to \\server\share.
-        DestName[0]=CPATHDIVIDER;
-        DestName[1]=CPATHDIVIDER;
-      }
-  }
 }
 
 
@@ -1210,7 +1372,7 @@ bool CmdExtract::ExtrDllGetPassword()
         *PasswordA=0;
         if (Cmd->Callback(UCM_NEEDPASSWORD,Cmd->UserData,(LPARAM)PasswordA,ASIZE(PasswordA))==-1)
           *PasswordA=0;
-        GetWideName(PasswordA,NULL,PasswordW,ASIZE(PasswordW));
+        CharToWide(PasswordA,PasswordW,ASIZE(PasswordW));
         cleandata(PasswordA,sizeof(PasswordA));
       }
       Cmd->Password.Set(PasswordW);
@@ -1226,7 +1388,7 @@ bool CmdExtract::ExtrDllGetPassword()
 
 
 #ifndef RARDLL
-bool CmdExtract::ExtrGetPassword(Archive &Arc,const wchar *ArcFileName,RarCheckPassword *CheckPwd)
+bool CmdExtract::ExtrGetPassword(Archive &Arc,const std::wstring &ArcFileName,RarCheckPassword *CheckPwd)
 {
   if (!Cmd->Password.IsSet())
   {
@@ -1242,7 +1404,7 @@ bool CmdExtract::ExtrGetPassword(Archive &Arc,const wchar *ArcFileName,RarCheckP
   else
     if (!GlobalPassword && !Arc.FileHead.Solid)
     {
-      eprintf(St(MUseCurPsw),ArcFileName);
+      eprintf(St(MUseCurPsw),ArcFileName.c_str());
       switch(Cmd->AllYes ? 1 : Ask(St(MYesNoAll)))
       {
         case -1:
@@ -1283,19 +1445,25 @@ void CmdExtract::ConvertDosPassword(Archive &Arc,SecPassword &DestPwd)
 #endif
 
 
-void CmdExtract::ExtrCreateDir(Archive &Arc,const wchar *ArcFileName)
+void CmdExtract::ExtrCreateDir(Archive &Arc,const std::wstring &ArcFileName)
 {
   if (Cmd->Test)
   {
     if (!Cmd->DisableNames)
     {
-      mprintf(St(MExtrTestFile),ArcFileName);
+      mprintf(St(MExtrTestFile),ArcFileName.c_str());
       mprintf(L" %s",St(MOk));
     }
     return;
   }
 
-  MKDIR_CODE MDCode=MakeDir(DestFileName,!Cmd->IgnoreGeneralAttr,Arc.FileHead.FileAttr);
+  auto FileAttr=Arc.FileHead.FileAttr;
+#ifdef _UNIX
+  if (geteuid()!=0) // Unless root.
+    FileAttr &= ~S_ISUID; // Strip SUID and keep SGID for standard users.
+#endif
+  
+  MKDIR_CODE MDCode=MakeDir(DestFileName,!Cmd->IgnoreGeneralAttr,FileAttr);
   bool DirExist=false;
   if (MDCode!=MKDIR_SUCCESS)
   {
@@ -1305,29 +1473,27 @@ void CmdExtract::ExtrCreateDir(Archive &Arc,const wchar *ArcFileName)
       // File with name same as this directory exists. Propose user
       // to overwrite it.
       bool UserReject;
-      FileCreate(Cmd,NULL,DestFileName,ASIZE(DestFileName),&UserReject,Arc.FileHead.UnpSize,&Arc.FileHead.mtime);
+      FileCreate(Cmd,nullptr,DestFileName,&UserReject,Arc.FileHead.UnpSize,&Arc.FileHead.mtime,FILECR_FOLDER);
       DirExist=false;
     }
     if (!DirExist)
     {
       CreatePath(DestFileName,true,Cmd->DisableNames);
-      MDCode=MakeDir(DestFileName,!Cmd->IgnoreGeneralAttr,Arc.FileHead.FileAttr);
+      MDCode=MakeDir(DestFileName,!Cmd->IgnoreGeneralAttr,FileAttr);
       if (MDCode!=MKDIR_SUCCESS && !IsNameUsable(DestFileName))
       {
         uiMsg(UIMSG_CORRECTINGNAME,Arc.FileName);
-        wchar OrigName[ASIZE(DestFileName)];
-        wcsncpyz(OrigName,DestFileName,ASIZE(OrigName));
+        std::wstring OrigName=DestFileName;
         MakeNameUsable(DestFileName,true);
 #ifndef SFX_MODULE
         uiMsg(UIERROR_RENAMING,Arc.FileName,OrigName,DestFileName);
 #endif
         DirExist=FileExist(DestFileName) && IsDir(GetFileAttr(DestFileName));
-        if (!DirExist)
+        if (!DirExist && (Cmd->AbsoluteLinks || !ConvertSymlinkPaths ||
+            LinksToDirs(DestFileName,Cmd->ExtrPath,LastCheckedSymlink)))
         {
-          if (!Cmd->AbsoluteLinks && ConvertSymlinkPaths)
-            LinksToDirs(DestFileName,Cmd->ExtrPath,LastCheckedSymlink);
           CreatePath(DestFileName,true,Cmd->DisableNames);
-          MDCode=MakeDir(DestFileName,!Cmd->IgnoreGeneralAttr,Arc.FileHead.FileAttr);
+          MDCode=MakeDir(DestFileName,!Cmd->IgnoreGeneralAttr,FileAttr);
         }
       }
     }
@@ -1336,16 +1502,24 @@ void CmdExtract::ExtrCreateDir(Archive &Arc,const wchar *ArcFileName)
   {
     if (!Cmd->DisableNames)
     {
-      mprintf(St(MCreatDir),DestFileName);
+      mprintf(St(MCreatDir),DestFileName.c_str());
       mprintf(L" %s",St(MOk));
     }
+#ifdef _UNIX
+    // We need to set Unix attributes for DirExist as well, because Unix mkdir
+    // strips all attributes not in umask(). Archives created by recent
+    // RAR versions store directories after their contents, so risk of setting
+    // attributes, which prevent us creating files, is minimal.
+    if (!Cmd->IgnoreGeneralAttr)
+      SetFileAttr(DestFileName,FileAttr);
+#endif
     PrevProcessed=true;
   }
   else
     if (DirExist)
     {
       if (!Cmd->IgnoreGeneralAttr)
-        SetFileAttr(DestFileName,Arc.FileHead.FileAttr);
+        SetFileAttr(DestFileName,FileAttr);
       PrevProcessed=true;
     }
     else
@@ -1361,7 +1535,7 @@ void CmdExtract::ExtrCreateDir(Archive &Arc,const wchar *ArcFileName)
   {
 #if defined(_WIN_ALL) && !defined(SFX_MODULE)
     if (Cmd->SetCompressedAttr &&
-        (Arc.FileHead.FileAttr & FILE_ATTRIBUTE_COMPRESSED)!=0 && WinNT()!=WNT_NONE)
+        (FileAttr & FILE_ATTRIBUTE_COMPRESSED)!=0 && WinNT()!=WNT_NONE)
       SetFileCompression(DestFileName,true);
 #endif
     SetFileHeaderExtra(Cmd,Arc,DestFileName);
@@ -1373,7 +1547,7 @@ void CmdExtract::ExtrCreateDir(Archive &Arc,const wchar *ArcFileName)
 }
 
 
-bool CmdExtract::ExtrCreateFile(Archive &Arc,File &CurFile)
+bool CmdExtract::ExtrCreateFile(Archive &Arc,File &CurFile,bool WriteOnly)
 {
   bool Success=true;
   wchar Command=Cmd->Command[0];
@@ -1383,10 +1557,9 @@ bool CmdExtract::ExtrCreateFile(Archive &Arc,File &CurFile)
 #endif
   if ((Command=='E' || Command=='X') && !Cmd->Test)
   {
+    FILECR_FLAGS Flags=WriteOnly ? FILECR_WRITEONLY:FILECR_DEFAULT;
     bool UserReject;
-    // Specify "write only" mode to avoid OpenIndiana NAS problems
-    // with SetFileTime and read+write files.
-    if (!FileCreate(Cmd,&CurFile,DestFileName,ASIZE(DestFileName),&UserReject,Arc.FileHead.UnpSize,&Arc.FileHead.mtime,true))
+    if (!FileCreate(Cmd,&CurFile,DestFileName,&UserReject,Arc.FileHead.UnpSize,&Arc.FileHead.mtime,Flags))
     {
       Success=false;
       if (!UserReject)
@@ -1402,23 +1575,24 @@ bool CmdExtract::ExtrCreateFile(Archive &Arc,File &CurFile)
         {
           uiMsg(UIMSG_CORRECTINGNAME,Arc.FileName);
 
-          wchar OrigName[ASIZE(DestFileName)];
-          wcsncpyz(OrigName,DestFileName,ASIZE(OrigName));
+          std::wstring OrigName=DestFileName;
 
           MakeNameUsable(DestFileName,true);
 
-          if (!Cmd->AbsoluteLinks && ConvertSymlinkPaths)
-            LinksToDirs(DestFileName,Cmd->ExtrPath,LastCheckedSymlink);
-          CreatePath(DestFileName,true,Cmd->DisableNames);
-          if (FileCreate(Cmd,&CurFile,DestFileName,ASIZE(DestFileName),&UserReject,Arc.FileHead.UnpSize,&Arc.FileHead.mtime,true))
+          if (Cmd->AbsoluteLinks || !ConvertSymlinkPaths ||
+              LinksToDirs(DestFileName,Cmd->ExtrPath,LastCheckedSymlink))
           {
+            CreatePath(DestFileName,true,Cmd->DisableNames);
+            if (FileCreate(Cmd,&CurFile,DestFileName,&UserReject,Arc.FileHead.UnpSize,&Arc.FileHead.mtime,Flags))
+            {
 #ifndef SFX_MODULE
-            uiMsg(UIERROR_RENAMING,Arc.FileName,OrigName,DestFileName);
+              uiMsg(UIERROR_RENAMING,Arc.FileName,OrigName,DestFileName);
 #endif
-            Success=true;
+              Success=true;
+            }
+            else
+              ErrHandler.CreateErrorMsg(Arc.FileName,DestFileName);
           }
-          else
-            ErrHandler.CreateErrorMsg(Arc.FileName,DestFileName);
         }
       }
     }
@@ -1427,11 +1601,11 @@ bool CmdExtract::ExtrCreateFile(Archive &Arc,File &CurFile)
 }
 
 
-bool CmdExtract::CheckUnpVer(Archive &Arc,const wchar *ArcFileName)
+bool CmdExtract::CheckUnpVer(Archive &Arc,const std::wstring &ArcFileName)
 {
   bool WrongVer;
-  if (Arc.Format==RARFMT50) // Both SFX and RAR can unpack RAR 5.0 archives.
-    WrongVer=Arc.FileHead.UnpVer>VER_UNPACK5;
+  if (Arc.Format==RARFMT50) // Both SFX and RAR can unpack RAR 5.0 and 7.0 archives.
+    WrongVer=Arc.FileHead.UnpVer>VER_UNPACK7;
   else
   {
 #ifdef SFX_MODULE   // SFX can unpack only RAR 2.9 archives.
@@ -1445,10 +1619,16 @@ bool CmdExtract::CheckUnpVer(Archive &Arc,const wchar *ArcFileName)
   if (Arc.FileHead.Method==0)
     WrongVer=false;
 
+  // Can't unpack the unknown encryption even for stored files.
+  if (Arc.FileHead.CryptMethod==CRYPT_UNKNOWN)
+    WrongVer=true;
+
   if (WrongVer)
   {
     ErrHandler.UnknownMethodMsg(Arc.FileName,ArcFileName);
-    uiMsg(UIERROR_NEWERRAR,Arc.FileName);
+    // No need to suggest a new version if it is just a broken archive.
+    if (!Arc.BrokenHeader)
+      uiMsg(UIERROR_NEWERRAR,Arc.FileName);
   }
   return !WrongVer;
 }
@@ -1464,7 +1644,7 @@ bool CmdExtract::CheckUnpVer(Archive &Arc,const wchar *ArcFileName)
 // But it would be slower for solid archives than scaning headers
 // in first pass and extracting everything in second, as implemented now.
 // 
-void CmdExtract::AnalyzeArchive(const wchar *ArcName,bool Volume,bool NewNumbering)
+void CmdExtract::AnalyzeArchive(const std::wstring &ArcName,bool Volume,bool NewNumbering)
 {
   FreeAnalyzeData(); // If processing non-first archive in multiple archives set.
 
@@ -1474,11 +1654,11 @@ void CmdExtract::AnalyzeArchive(const wchar *ArcName,bool Volume,bool NewNumberi
     return; // No need to check further for * and *.* masks.
 
   // Start search from first volume if all volumes preceding current are available.
-  wchar NextName[NM];
+  std::wstring NextName;
   if (Volume)
-    GetFirstVolIfFullSet(ArcName,NewNumbering,NextName,ASIZE(NextName));
+    GetFirstVolIfFullSet(ArcName,NewNumbering,NextName);
   else
-    wcsncpyz(NextName,ArcName,ASIZE(NextName));
+    NextName=ArcName;
   
   bool MatchFound=false;
   bool PrevMatched=false;
@@ -1487,7 +1667,7 @@ void CmdExtract::AnalyzeArchive(const wchar *ArcName,bool Volume,bool NewNumberi
   bool FirstVolume=true;
   
   // We shall set FirstFile once for all volumes and not for each volume.
-  // So we do not reuse the outdated Analyze->StartPos from previous volume
+  // So we do not reuse the outdated Analyze.StartPos from previous volume
   // if extracted file resides completely in the beginning of current one.
   bool FirstFile=true;
 
@@ -1501,8 +1681,8 @@ void CmdExtract::AnalyzeArchive(const wchar *ArcName,bool Volume,bool NewNumberi
         // If we couldn't open trailing volumes, we can't set early exit
         // parameters. It is possible that some volume are on removable media
         // and will be provided by user when extracting.
-        *Analyze->EndName=0;
-        Analyze->EndPos=0;
+        Analyze.EndName.clear();
+        Analyze.EndPos=0;
       }
       break;
     }
@@ -1520,32 +1700,43 @@ void CmdExtract::AnalyzeArchive(const wchar *ArcName,bool Volume,bool NewNumberi
       }
       if (HeaderType==HEAD_FILE)
       {
+        if ((Arc.Format==RARFMT14 || Arc.Format==RARFMT15) && Arc.FileHead.UnpVer<=15)
+        {
+          // RAR versions earlier than 2.0 do not set per file solid flag.
+          // They have only the global archive solid flag, so we can't
+          // reliably analyze them here.
+          OpenNext=false;
+          break;
+        }
+
         if (!Arc.FileHead.SplitBefore)
         {
-          if (!MatchFound && !Arc.FileHead.Solid) // Can start extraction from here.
+          if (!MatchFound && !Arc.FileHead.Solid && !Arc.FileHead.Dir &&
+              Arc.FileHead.RedirType==FSREDIR_NONE && Arc.FileHead.Method!=0)
           {
+            // Can start extraction from here.
             // We would gain nothing and unnecessarily complicate extraction
             // if we set StartName for first volume or StartPos for first
             // archived file.
             if (!FirstVolume)
-              wcsncpyz(Analyze->StartName,NextName,ASIZE(Analyze->StartName));
+              Analyze.StartName=NextName;
 
             // We shall set FirstFile once for all volumes for this code
             // to work properly. Alternatively we could append 
-            // "|| Analyze->StartPos!=0" to the condition, so we do not reuse
-            // the outdated Analyze->StartPos value from previous volume.
+            // "|| Analyze.StartPos!=0" to the condition, so we do not reuse
+            // the outdated Analyze.StartPos value from previous volume.
             if (!FirstFile)
-              Analyze->StartPos=Arc.CurBlockPos;
+              Analyze.StartPos=Arc.CurBlockPos;
           }
 
-          if (Cmd->IsProcessFile(Arc.FileHead,NULL,MATCH_WILDSUBPATH,0,NULL,0)!=0)
+          if (Cmd->IsProcessFile(Arc.FileHead,NULL,MATCH_WILDSUBPATH,0,NULL)!=0)
           {
             MatchFound = true;
             PrevMatched = true;
 
             // Reset the previously set early exit position, if any, because
             // we found a new matched file.
-            Analyze->EndPos=0;
+            Analyze.EndPos=0;
 
             // Matched file reference pointing at maybe non-matched source file.
             // Even though we know RedirName, we can't check if source file
@@ -1554,8 +1745,8 @@ void CmdExtract::AnalyzeArchive(const wchar *ArcName,bool Volume,bool NewNumberi
             if (Arc.FileHead.RedirType==FSREDIR_FILECOPY)
             {
               bool AlreadyAdded=false;
-              for (size_t I=0;I<RefList.Size();I++)
-                if (wcscmp(Arc.FileHead.RedirName,RefList[I].RefName)==0)
+              for (size_t I=0;I<RefList.size();I++)
+                if (Arc.FileHead.RedirName==RefList[I].RefName)
                 {
                   // Increment the reference count if we added such reference
                   // source earlier.
@@ -1568,12 +1759,12 @@ void CmdExtract::AnalyzeArchive(const wchar *ArcName,bool Volume,bool NewNumberi
               // sensible value to prevent the excessive memory allocation.
               size_t MaxListSize=1000000;
 
-              if (!AlreadyAdded && RefList.Size()<MaxListSize)
+              if (!AlreadyAdded && RefList.size()<MaxListSize)
               {
-                ExtractRef Ref={0};
-                Ref.RefName=wcsdup(Arc.FileHead.RedirName);
+                ExtractRef Ref{};
+                Ref.RefName=Arc.FileHead.RedirName;
                 Ref.RefCount=1;
-                RefList.Push(Ref);
+                RefList.push_back(Ref);
               }
             }
           }
@@ -1585,8 +1776,8 @@ void CmdExtract::AnalyzeArchive(const wchar *ArcName,bool Volume,bool NewNumberi
               // when extracting if we set this value for first volume
               // or non-volume archive.
               if (!FirstVolume)
-                wcsncpyz(Analyze->EndName,NextName,ASIZE(Analyze->EndName));
-              Analyze->EndPos=Arc.CurBlockPos;
+                Analyze.EndName=NextName;
+              Analyze.EndPos=Arc.CurBlockPos;
             }
             PrevMatched=false;
           }
@@ -1605,7 +1796,7 @@ void CmdExtract::AnalyzeArchive(const wchar *ArcName,bool Volume,bool NewNumberi
 
     if (Volume && OpenNext)
     {
-      NextVolumeName(NextName,ASIZE(NextName),!Arc.NewNumbering);
+      NextVolumeName(NextName,!Arc.NewNumbering);
       FirstVolume=false;
 
       // Needed for multivolume archives. Added in case some 'break'
@@ -1620,8 +1811,8 @@ void CmdExtract::AnalyzeArchive(const wchar *ArcName,bool Volume,bool NewNumberi
 
   // If file references are present, we can't reliably skip in semi-solid
   // archives, because reference source can be present in skipped data.
-  if (RefList.Size()!=0)
-    memset(Analyze,0,sizeof(*Analyze));
+  if (RefList.size()!=0)
+    Analyze={};
 }
 #endif
 
@@ -1629,26 +1820,46 @@ void CmdExtract::AnalyzeArchive(const wchar *ArcName,bool Volume,bool NewNumberi
 #ifndef SFX_MODULE
 // Return the first volume name if all volumes preceding the specified
 // are available. Otherwise return the specified volume name.
-void CmdExtract::GetFirstVolIfFullSet(const wchar *SrcName,bool NewNumbering,wchar *DestName,size_t DestSize)
+void CmdExtract::GetFirstVolIfFullSet(const std::wstring &SrcName,bool NewNumbering,std::wstring &DestName)
 {
-  wchar FirstVolName[NM];
-  VolNameToFirstName(SrcName,FirstVolName,ASIZE(FirstVolName),NewNumbering);
-  wchar NextName[NM];
-  wcsncpyz(NextName,FirstVolName,ASIZE(NextName));
-  wchar ResultName[NM];
-  wcsncpyz(ResultName,SrcName,ASIZE(ResultName));
+  std::wstring FirstVolName;
+  VolNameToFirstName(SrcName,FirstVolName,NewNumbering);
+  std::wstring NextName=FirstVolName;
+  std::wstring ResultName=SrcName;
   while (true)
   {
-    if (wcscmp(SrcName,NextName)==0)
+    if (SrcName==NextName)
     {
-      wcsncpyz(ResultName,FirstVolName,DestSize);
+      ResultName=FirstVolName; // Reached the specified volume starting from the first.
       break;
     }
     if (!FileExist(NextName))
       break;
-    NextVolumeName(NextName,ASIZE(NextName),!NewNumbering);
+    NextVolumeName(NextName,!NewNumbering);
   }
-  wcsncpyz(DestName,ResultName,DestSize);
+  DestName=ResultName;
 }
-
 #endif
+
+
+bool CmdExtract::CheckWinLimit(Archive &Arc,std::wstring &ArcFileName)
+{
+  if (Arc.FileHead.WinSize<=Cmd->WinSizeLimit || Arc.FileHead.WinSize<=Cmd->WinSize)
+    return true;
+  if (uiDictLimit(Cmd,ArcFileName,Arc.FileHead.WinSize,Max(Cmd->WinSizeLimit,Cmd->WinSize)))
+  {
+    // No more prompts when extracting other files. Important for GUI versions,
+    // where we might not have [Max]WinSize set permanently when extracting.
+    Cmd->WinSizeLimit=Arc.FileHead.WinSize;
+  }
+  else
+  {
+    ErrHandler.SetErrorCode(RARX_FATAL);
+#ifdef RARDLL
+    Cmd->DllError=ERAR_LARGE_DICT;
+#endif
+    Arc.SeekToNext();
+    return false;
+  }
+  return true;
+}
